@@ -3,6 +3,7 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 from collections.abc import Callable
+import functools
 from typing import Optional
 
 import torch
@@ -42,6 +43,34 @@ def _build_code(quant_type: str, device) -> Optional[torch.Tensor]:
     return code.to(device) if device is not None else code
 
 
+class _FrozenLinearRecomputeBackward(torch.autograd.Function):
+    """``F.linear`` against a frozen dequantized weight, re-dequantizing it in backward.
+
+    The weight produced by ``dequant_fn`` (a closure over the packed buffers) is an
+    intermediate, not a Parameter, so a plain ``F.linear`` would stash it as a saved
+    activation for the whole forward-to-backward window — one full-precision expert
+    weight per projection per layer. Because the base is frozen, backward needs no
+    gradient for the weight and only computes ``grad_output @ weight``; the weight can
+    therefore be dropped after the forward matmul and re-dequantized on demand, keeping
+    training memory independent of the number of experts held between forward and
+    backward. Numerically identical to dequantize-then-``linear`` by construction — the
+    forward *is* dequantize-then-linear; recomputation only changes what is saved, never
+    what is computed.
+    """
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, dequant_fn: Callable[[], torch.Tensor]) -> torch.Tensor:
+        ctx.dequant_fn = dequant_fn
+        return F_nn.linear(x, dequant_fn())
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        grad_x = None
+        if ctx.needs_input_grad[0]:
+            grad_x = grad_output @ ctx.dequant_fn()
+        return grad_x, None
+
+
 class ExpertsNbit(nn.Module):
     """Low-bit quantized storage for fused Mixture-of-Experts expert weights.
 
@@ -72,8 +101,11 @@ class ExpertsNbit(nn.Module):
     ``state_dict`` mechanism with no custom save/load hooks.
 
     The forward pass dequantizes a single expert at a time (a per-expert loop), mirroring
-    the reference fused-experts forward. Grouped-GEMM is intentionally left for future
-    work.
+    the reference fused-experts forward. In training, the dequantized weight is not kept
+    as a saved activation: it is re-dequantized on demand in backward (see
+    :class:`_FrozenLinearRecomputeBackward`), for every storage scheme, so activation
+    memory stays independent of the number of experts. Grouped-GEMM is intentionally left
+    for future work.
 
     <Tip warning={true}>This feature is experimental and may change in future releases.</Tip>
 
@@ -299,9 +331,13 @@ class ExpertsNbit(nn.Module):
         return F.dequantize_4bit(packed[expert_idx].reshape(-1, 1), quant_state=quant_state)
 
     def _project(self, packed, absmax, shape, expert_idx, x, compute_dtype):
-        """One expert projection: dequantize + ``linear``."""
-        weight = self._dequantize_expert(packed, absmax, shape, expert_idx, compute_dtype)
-        return F_nn.linear(x, weight)
+        """One expert projection: dequantize + ``linear``, re-dequantizing in backward.
+
+        Works identically for every storage scheme — the recompute closure is just
+        :meth:`_dequantize_expert` — and never produces a gradient for the frozen storage.
+        """
+        dequant_fn = functools.partial(self._dequantize_expert, packed, absmax, shape, expert_idx, compute_dtype)
+        return _FrozenLinearRecomputeBackward.apply(x, dequant_fn)
 
     def forward(
         self,
